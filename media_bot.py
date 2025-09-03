@@ -14,7 +14,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 from telegram.error import NetworkError, TimedOut, RetryAfter
 from mp3_downloader import MP3Downloader
-from bot_notifications import create_notification_manager
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ (УБИРАЕМ СПАМ) ---
 logging.getLogger('httpx').setLevel(logging.ERROR)
@@ -31,13 +30,10 @@ logging.basicConfig(
 # --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_IDS_STR = os.getenv("ALLOWED_GROUP_IDS")
-ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")  # Новая переменная для группы админа
+ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")
 TEMP_DOWNLOADS_DIR = "/app/bot_temp"
 COOKIES_DIR = "/app/cookies"
 TELEGRAM_SIZE_LIMIT_BYTES = 49 * 1024 * 1024 # 49 МБ для надежности
-NOTIFICATIONS_ENABLED = os.getenv("BOT_NOTIFICATIONS", "no")
-
-notification_manager = create_notification_manager(GROUP_IDS_STR, NOTIFICATIONS_ENABLED)
 
 if not BOT_TOKEN or not GROUP_IDS_STR:
     logging.critical("ERROR: BOT_TOKEN, ALLOWED_GROUP_IDS environment variables not set!")
@@ -59,6 +55,7 @@ try:
 except (ValueError, TypeError):
     logging.critical(f"ERROR: Invalid format in ALLOWED_GROUP_IDS.")
     exit()
+
 if not os.path.exists(TEMP_DOWNLOADS_DIR):
     try: os.makedirs(TEMP_DOWNLOADS_DIR)
     except OSError as e: logging.critical(f"Failed to create directory {TEMP_DOWNLOADS_DIR}: {e}"); exit()
@@ -171,7 +168,6 @@ class CookieRotator:
 
         attempts_total = len(self.cookie_files)
         last_error = None
-        photo_only_detected = False
 
         for attempt in range(attempts_total):
             try:
@@ -192,7 +188,6 @@ class CookieRotator:
                 # Проверяем, является ли это ошибкой "только фото"
                 if error_msg.startswith("PHOTO_ONLY:"):
                     logger.info(f"ℹ️ Instagram cookie {cookie_name}: Detected photo-only post")
-                    photo_only_detected = True
                     # Для фото-постов не пробуем другие cookie, сразу возвращаем ошибку
                     raise e
                 else:
@@ -602,10 +597,102 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
         return None, f"Ошибка скачивания: {error_msg}"
 
 async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) -> str | None:
-    logger.info("🎬 YouTube Shorts: Looking for the best available file (not higher than 720p)...")
-    format_selector = "best[height<=720][ext=mp4]/best[ext=mp4]/best[height<=720]/best"
-
-    # Base yt-dlp command with extra reliability flags
+    """Скачивает YouTube Shorts с приоритетом 720p и выше, ниже 720p только в крайнем случае"""
+    logger.info("🎬 YouTube Shorts: Getting available formats...")
+    
+    # Получаем информацию о доступных форматах
+    info_command = [
+        'yt-dlp', '--dump-json', '--no-warnings',
+        '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
+        '--add-header', 'Referer: https://www.youtube.com/',
+        url
+    ]
+    
+    # До 3 попыток для получения информации
+    for info_attempt in range(1, 4):
+        try:
+            logger.info(f"🔍 YouTube Shorts: Getting info attempt {info_attempt}/3")
+            stdout, stderr = await run_subprocess(info_command, timeout=60, suppress_stdout_log=True)
+            
+            if not stdout.strip():
+                logger.warning(f"⚠️ Empty response on info attempt {info_attempt}")
+                continue
+                
+            video_info = json.loads(stdout)
+            break
+            
+        except Exception as e:
+            logger.warning(f"❌ Info attempt {info_attempt} failed: {e}")
+            if info_attempt == 3:
+                logger.error("❌ All info attempts failed for YouTube Shorts")
+                return None
+            continue
+    else:
+        return None
+    
+    # Анализируем и выбираем лучший формат
+    logger.info("🎯 YouTube Shorts: Analyzing available formats...")
+    formats = video_info.get('formats', [])
+    
+    if not formats:
+        logger.error("❌ No formats available")
+        return None
+    
+    # Фильтруем только видео форматы
+    video_formats = []
+    for fmt in formats:
+        # Пропускаем аудио-только форматы
+        if fmt.get('vcodec') == 'none':
+            continue
+            
+        # Получаем основные параметры
+        height = fmt.get('height', 0)
+        ext = fmt.get('ext', '')
+        filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+        tbr = fmt.get('tbr', 0)
+        format_id = fmt.get('format_id', '')
+        
+        video_formats.append({
+            'format_id': format_id,
+            'height': height,
+            'ext': ext,
+            'filesize': filesize,
+            'tbr': tbr,
+            'is_mp4': ext.lower() == 'mp4'
+        })
+    
+    if not video_formats:
+        logger.error("❌ No video formats found")
+        return None
+    
+    # Группируем форматы по разрешению
+    resolution_groups = {}
+    for fmt in video_formats:
+        height = fmt['height']
+        if height not in resolution_groups:
+            resolution_groups[height] = []
+        resolution_groups[height].append(fmt)
+    
+    # Сортируем разрешения
+    available_resolutions = sorted(resolution_groups.keys())
+    logger.info(f"📊 Available resolutions: {available_resolutions}")
+    
+    # НОВАЯ ЛОГИКА: Приоритет 720p и выше по возрастанию, потом ниже 720p
+    resolution_priority = []
+    
+    # Сначала добавляем разрешения >= 720p в порядке возрастания (720p, 1080p, 1440p, 2160p...)
+    high_quality_resolutions = sorted([r for r in available_resolutions if r >= 720])
+    resolution_priority.extend(high_quality_resolutions)
+    
+    # Затем добавляем разрешения < 720p в порядке убывания (480p, 360p, 240p...) - только если не нашли >= 720p
+    low_quality_resolutions = sorted([r for r in available_resolutions if r < 720], reverse=True)
+    resolution_priority.extend(low_quality_resolutions)
+    
+    logger.info(f"🎯 Resolution priority order: {resolution_priority}")
+    logger.info(f"🔥 Preferred: >= 720p formats: {high_quality_resolutions}")
+    logger.info(f"💀 Fallback: < 720p formats: {low_quality_resolutions}")
+    
+    # Пробуем форматы в порядке приоритета
     base_command = [
         'yt-dlp', '--rm-cache-dir', '--force-ipv4',
         '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
@@ -613,35 +700,98 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
         '--http-chunk-size', '10M',
         url,
         '--playlist-items', '1',
-        '-f', format_selector,
         '-o', os.path.join(temp_folder, 'final_video.%(ext)s'),
         '--no-warnings'
     ]
 
-    # Up to 3 retry attempts
-    for attempt in range(1, 4):
-        logger.info(f"▶️ YouTube Shorts: Attempt {attempt}/3")
-
-        try:
-            stdout, stderr = await run_subprocess(base_command)
-
-            # Check for 403 error in stderr
-            if "HTTP Error 403" in stderr:
-                logger.warning("⚠️ HTTP 403 Forbidden detected. Retrying...")
+    for resolution in resolution_priority:
+        formats_for_resolution = resolution_groups[resolution]
+        
+        # Указываем качество для логов
+        quality_tier = "🔥 PREFERRED" if resolution >= 720 else "💀 FALLBACK"
+        
+        # Сортируем форматы этого разрешения: MP4 сначала, потом по битрейту
+        formats_for_resolution.sort(key=lambda x: (x['is_mp4'], x['tbr']), reverse=True)
+        
+        for fmt in formats_for_resolution:
+            # Проверяем размер файла, если известен
+            if fmt['filesize'] and fmt['filesize'] > TELEGRAM_SIZE_LIMIT_BYTES:
+                logger.info(f"⚠️ {quality_tier} Skipping format {fmt['format_id']} ({resolution}p) - too large: {fmt['filesize']/1024/1024:.1f}MB")
                 continue
+            
+            logger.info(f"📹 {quality_tier} Trying format {fmt['format_id']} ({resolution}p, {fmt['ext']}, size: {fmt['filesize']/1024/1024:.1f}MB if known)")
+            
+            # Копируем команду и добавляем селектор формата
+            command = base_command.copy()
+            command.extend(['-f', fmt['format_id']])
+            
+            try:
+                stdout, stderr = await run_subprocess(command, timeout=120)
+                
+                # Проверяем на 403 ошибку
+                if "HTTP Error 403" in stderr:
+                    logger.warning("⚠️ HTTP 403 Forbidden detected, trying next format...")
+                    continue
+                
+                # Ищем скачанный файл
+                video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
+                if video_files:
+                    file_path = video_files[0]
+                    file_size = os.path.getsize(file_path)
+                    
+                    # Проверяем размер скачанного файла
+                    if file_size > TELEGRAM_SIZE_LIMIT_BYTES:
+                        logger.warning(f"⚠️ Downloaded file too large: {file_size/1024/1024:.1f}MB, removing and trying next format")
+                        os.remove(file_path)
+                        continue
+                    
+                    quality_log = "🔥 EXCELLENT" if resolution >= 720 else "💀 ACCEPTABLE"
+                    logger.info(f"✅ {quality_log} SUCCESS! Downloaded {resolution}p video: {file_path} ({file_size/1024/1024:.1f}MB)")
+                    return file_path
+                else:
+                    logger.warning(f"⚠️ No video file created for format {fmt['format_id']}")
+                    
+            except Exception as e:
+                logger.warning(f"❌ Failed format {fmt['format_id']} ({resolution}p): {str(e)}")
 
-            # Check if MP4 file exists
-            video_files = glob.glob(os.path.join(temp_folder, '*.mp4'))
+    # Если ни один конкретный формат не сработал, пробуем общие селекторы в правильном порядке
+    logger.info("🔄 Trying fallback format selectors...")
+    fallback_selectors = [
+        "best[height>=720][ext=mp4]",  # Приоритет: MP4 >= 720p
+        "best[height>=720]",           # Любой формат >= 720p  
+        "best[ext=mp4]",               # MP4 любого качества
+        "best[height<=720][ext=mp4]",  # MP4 <= 720p (на случай если >= 720p нет)
+        "best[height<=720]",           # Любой формат <= 720p
+        "best"                         # Последний шанс - любой лучший
+    ]
+    
+    for selector in fallback_selectors:
+        selector_type = "🔥 PREFERRED" if ">=720" in selector else "💀 FALLBACK"
+        logger.info(f"🎯 {selector_type} Trying fallback selector: {selector}")
+        
+        command = base_command.copy()
+        command.extend(['-f', selector])
+        
+        try:
+            stdout, stderr = await run_subprocess(command, timeout=120)
+            
+            video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
             if video_files:
-                logger.info(f"✅ YouTube Shorts video successfully downloaded: {video_files[0]}")
-                return video_files[0]
-            else:
-                logger.warning(f"⚠️ Downloaded file is not MP4 or was not found. Files: {video_files}")
-
+                file_path = video_files[0]
+                file_size = os.path.getsize(file_path)
+                
+                if file_size > TELEGRAM_SIZE_LIMIT_BYTES:
+                    logger.warning(f"⚠️ Fallback file too large: {file_size/1024/1024:.1f}MB")
+                    os.remove(file_path)
+                    continue
+                
+                logger.info(f"✅ SUCCESS with fallback selector {selector}: {file_path} ({file_size/1024/1024:.1f}MB)")
+                return file_path
+                
         except Exception as e:
-            logger.error(f"❌ yt-dlp failed on attempt {attempt}. Error: {str(e)}")
+            logger.warning(f"❌ Failed fallback selector {selector}: {str(e)}")
 
-    logger.error("❌ All YouTube Shorts download attempts have failed.")
+    logger.error("❌ All YouTube Shorts download attempts failed")
     return None
 
 async def get_video_metadata(video_path: str) -> tuple[int | None, int | None, int | None]:
@@ -904,7 +1054,7 @@ async def process_youtube_shorts_link(update: Update, context: ContextTypes.DEFA
             error_details += f"User: {user.username or user.first_name} (ID: {user.id})\n"
             error_details += f"Chat ID: {chat_id}\n"
             error_details += f"Message ID: {msg_id}\n"
-            error_details += "All 3 download attempts failed."
+            error_details += "All quality-priority download attempts failed."
 
             await send_error_to_admin(
                 context,
@@ -969,10 +1119,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         # Для всех остальных ошибок логируем кратко
         logger.error(f"❌ Ошибка Telegram Bot API: {type(error).__name__}: {str(error)}")
 
-
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
-    notification_manager.set_application(application)
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("downloadmp3", downloadmp3_command))
@@ -981,7 +1129,7 @@ def main():
 
     async def post_init(application):
         await setup_commands(application)
-        await notification_manager.send_startup_notification()
+    
     application.post_init = post_init
     application.run_polling()
 
