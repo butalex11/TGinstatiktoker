@@ -1,5 +1,6 @@
 FROM python:3.12-slim
 
+
 WORKDIR /app
 
 RUN apt-get update && \
@@ -8,7 +9,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --upgrade yt-dlp
+
 COPY . .
 
 CMD ["python", "/app/media_bot.py"]
