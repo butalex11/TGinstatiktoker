@@ -131,7 +131,6 @@ When starting the container, you can customize its behavior by using the followi
 | `BOT_TOKEN` (required)                 | Telegram bot token for authentication. Obtainable from [BotFather](https://t.me/botfather).  | `"123456789:ABCDEF-ghijklmnopqrstuvwxyz"` |empty|
 | `ALLOWED_GROUP_IDS` (required)         | Comma-separated list of allowed Telegram group IDs where the bot will operate.               | `"-1001234537890,-1001876542210"` |empty|
 | `ADMIN_GROUP_ID` (optionally)          | Telegram group ID for admin error notifications. If not set, error reporting is disabled.    | `"-1001224267890"`     |empty|
-| `BOT_NOTIFICATIONS` (optionally)          | To enable bot notifications on docker container start or stop set the variable to "yes"    | `"-1001224267890"`     |no|
 
 Feel free to adjust these variables based on your use case.
 
