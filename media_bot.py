@@ -597,9 +597,9 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
         return None, f"Ошибка скачивания: {error_msg}"
 
 async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) -> str | None:
-    """Скачивает YouTube Shorts с приоритетом 720p и выше, ниже 720p только в крайнем случае"""
+    """Скачивает YouTube Shorts с гарантированным звуком, приоритет 720p и выше"""
     logger.info("🎬 YouTube Shorts: Getting available formats...")
-    
+
     # Получаем информацию о доступных форматах
     info_command = [
         'yt-dlp', '--dump-json', '--no-warnings',
@@ -607,20 +607,20 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
         '--add-header', 'Referer: https://www.youtube.com/',
         url
     ]
-    
+
     # До 3 попыток для получения информации
     for info_attempt in range(1, 4):
         try:
             logger.info(f"🔍 YouTube Shorts: Getting info attempt {info_attempt}/3")
             stdout, stderr = await run_subprocess(info_command, timeout=60, suppress_stdout_log=True)
-            
+
             if not stdout.strip():
                 logger.warning(f"⚠️ Empty response on info attempt {info_attempt}")
                 continue
-                
+
             video_info = json.loads(stdout)
             break
-            
+
         except Exception as e:
             logger.warning(f"❌ Info attempt {info_attempt} failed: {e}")
             if info_attempt == 3:
@@ -629,70 +629,64 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
             continue
     else:
         return None
-    
-    # Анализируем и выбираем лучший формат
-    logger.info("🎯 YouTube Shorts: Analyzing available formats...")
+
+    # Проверяем доступные форматы
     formats = video_info.get('formats', [])
-    
     if not formats:
         logger.error("❌ No formats available")
         return None
-    
-    # Фильтруем только видео форматы
-    video_formats = []
+
+    logger.info("🎯 YouTube Shorts: Analyzing available formats for video+audio...")
+
+    # Группируем форматы: комбинированные (видео+аудио) и отдельные
+    combined_formats = []  # Форматы с видео и аудио
+    video_only_formats = []  # Только видео
+    audio_formats = []  # Только аудио
+
     for fmt in formats:
-        # Пропускаем аудио-только форматы
-        if fmt.get('vcodec') == 'none':
-            continue
-            
-        # Получаем основные параметры
+        vcodec = fmt.get('vcodec', 'none')
+        acodec = fmt.get('acodec', 'none')
         height = fmt.get('height', 0)
         ext = fmt.get('ext', '')
         filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
         tbr = fmt.get('tbr', 0)
         format_id = fmt.get('format_id', '')
-        
-        video_formats.append({
-            'format_id': format_id,
-            'height': height,
-            'ext': ext,
-            'filesize': filesize,
-            'tbr': tbr,
-            'is_mp4': ext.lower() == 'mp4'
-        })
-    
-    if not video_formats:
-        logger.error("❌ No video formats found")
-        return None
-    
-    # Группируем форматы по разрешению
-    resolution_groups = {}
-    for fmt in video_formats:
-        height = fmt['height']
-        if height not in resolution_groups:
-            resolution_groups[height] = []
-        resolution_groups[height].append(fmt)
-    
-    # Сортируем разрешения
-    available_resolutions = sorted(resolution_groups.keys())
-    logger.info(f"📊 Available resolutions: {available_resolutions}")
-    
-    # НОВАЯ ЛОГИКА: Приоритет 720p и выше по возрастанию, потом ниже 720p
-    resolution_priority = []
-    
-    # Сначала добавляем разрешения >= 720p в порядке возрастания (720p, 1080p, 1440p, 2160p...)
-    high_quality_resolutions = sorted([r for r in available_resolutions if r >= 720])
-    resolution_priority.extend(high_quality_resolutions)
-    
-    # Затем добавляем разрешения < 720p в порядке убывания (480p, 360p, 240p...) - только если не нашли >= 720p
-    low_quality_resolutions = sorted([r for r in available_resolutions if r < 720], reverse=True)
-    resolution_priority.extend(low_quality_resolutions)
-    
-    logger.info(f"🎯 Resolution priority order: {resolution_priority}")
-    logger.info(f"🔥 Preferred: >= 720p formats: {high_quality_resolutions}")
-    logger.info(f"💀 Fallback: < 720p formats: {low_quality_resolutions}")
-    
-    # Пробуем форматы в порядке приоритета
+
+        if vcodec != 'none' and acodec != 'none':
+            # Комбинированный формат (видео + аудио)
+            combined_formats.append({
+                'format_id': format_id,
+                'height': height,
+                'ext': ext,
+                'filesize': filesize,
+                'tbr': tbr,
+                'is_mp4': ext.lower() == 'mp4',
+                'type': 'combined'
+            })
+        elif vcodec != 'none' and acodec == 'none':
+            # Только видео
+            video_only_formats.append({
+                'format_id': format_id,
+                'height': height,
+                'ext': ext,
+                'filesize': filesize,
+                'tbr': tbr,
+                'is_mp4': ext.lower() == 'mp4',
+                'type': 'video_only'
+            })
+        elif vcodec == 'none' and acodec != 'none':
+            # Только аудио
+            audio_formats.append({
+                'format_id': format_id,
+                'ext': ext,
+                'filesize': filesize,
+                'tbr': tbr,
+                'abr': fmt.get('abr', 0),
+                'type': 'audio_only'
+            })
+
+    logger.info(f"📊 Found formats: {len(combined_formats)} combined, {len(video_only_formats)} video-only, {len(audio_formats)} audio-only")
+
     base_command = [
         'yt-dlp', '--rm-cache-dir', '--force-ipv4',
         '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
@@ -704,94 +698,149 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
         '--no-warnings'
     ]
 
-    for resolution in resolution_priority:
-        formats_for_resolution = resolution_groups[resolution]
-        
-        # Указываем качество для логов
-        quality_tier = "🔥 PREFERRED" if resolution >= 720 else "💀 FALLBACK"
-        
-        # Сортируем форматы этого разрешения: MP4 сначала, потом по битрейту
-        formats_for_resolution.sort(key=lambda x: (x['is_mp4'], x['tbr']), reverse=True)
-        
-        for fmt in formats_for_resolution:
-            # Проверяем размер файла, если известен
-            if fmt['filesize'] and fmt['filesize'] > TELEGRAM_SIZE_LIMIT_BYTES:
-                logger.info(f"⚠️ {quality_tier} Skipping format {fmt['format_id']} ({resolution}p) - too large: {fmt['filesize']/1024/1024:.1f}MB")
-                continue
-            
-            logger.info(f"📹 {quality_tier} Trying format {fmt['format_id']} ({resolution}p, {fmt['ext']}, size: {fmt['filesize']/1024/1024:.1f}MB if known)")
-            
-            # Копируем команду и добавляем селектор формата
-            command = base_command.copy()
-            command.extend(['-f', fmt['format_id']])
-            
-            try:
-                stdout, stderr = await run_subprocess(command, timeout=120)
-                
-                # Проверяем на 403 ошибку
-                if "HTTP Error 403" in stderr:
-                    logger.warning("⚠️ HTTP 403 Forbidden detected, trying next format...")
-                    continue
-                
-                # Ищем скачанный файл
-                video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
-                if video_files:
-                    file_path = video_files[0]
-                    file_size = os.path.getsize(file_path)
-                    
-                    # Проверяем размер скачанного файла
-                    if file_size > TELEGRAM_SIZE_LIMIT_BYTES:
-                        logger.warning(f"⚠️ Downloaded file too large: {file_size/1024/1024:.1f}MB, removing and trying next format")
-                        os.remove(file_path)
-                        continue
-                    
-                    quality_log = "🔥 EXCELLENT" if resolution >= 720 else "💀 ACCEPTABLE"
-                    logger.info(f"✅ {quality_log} SUCCESS! Downloaded {resolution}p video: {file_path} ({file_size/1024/1024:.1f}MB)")
-                    return file_path
-                else:
-                    logger.warning(f"⚠️ No video file created for format {fmt['format_id']}")
-                    
-            except Exception as e:
-                logger.warning(f"❌ Failed format {fmt['format_id']} ({resolution}p): {str(e)}")
+    # СТРАТЕГИЯ 1: Пробуем комбинированные форматы (видео+аудио в одном файле)
+    if combined_formats:
+        logger.info("🔥 YouTube Shorts: Trying combined video+audio formats...")
 
-    # Если ни один конкретный формат не сработал, пробуем общие селекторы в правильном порядке
-    logger.info("🔄 Trying fallback format selectors...")
-    fallback_selectors = [
-        "best[height>=720][ext=mp4]",  # Приоритет: MP4 >= 720p
-        "best[height>=720]",           # Любой формат >= 720p  
-        "best[ext=mp4]",               # MP4 любого качества
-        "best[height<=720][ext=mp4]",  # MP4 <= 720p (на случай если >= 720p нет)
-        "best[height<=720]",           # Любой формат <= 720p
-        "best"                         # Последний шанс - любой лучший
+        # Группируем по разрешению и сортируем: >= 720p сначала, потом < 720p
+        resolution_groups = {}
+        for fmt in combined_formats:
+            height = fmt['height']
+            if height not in resolution_groups:
+                resolution_groups[height] = []
+            resolution_groups[height].append(fmt)
+
+        available_resolutions = sorted(resolution_groups.keys())
+        high_quality = sorted([r for r in available_resolutions if r >= 720])
+        low_quality = sorted([r for r in available_resolutions if r < 720], reverse=True)
+        resolution_priority = high_quality + low_quality
+
+        logger.info(f"🎯 Combined format resolution priority: {resolution_priority}")
+
+        for resolution in resolution_priority:
+            formats_for_resolution = resolution_groups[resolution]
+            # Сортируем: MP4 сначала, потом по битрейту
+            formats_for_resolution.sort(key=lambda x: (x['is_mp4'], x['tbr']), reverse=True)
+
+            for fmt in formats_for_resolution:
+                quality_tier = "🔥 PREFERRED" if resolution >= 720 else "💀 FALLBACK"
+
+                # Проверяем размер файла
+                if fmt['filesize'] and fmt['filesize'] > TELEGRAM_SIZE_LIMIT_BYTES:
+                    logger.info(f"⚠️ {quality_tier} Skipping combined format {fmt['format_id']} ({resolution}p) - too large: {fmt['filesize']/1024/1024:.1f}MB")
+                    continue
+
+                logger.info(f"🎵 {quality_tier} Trying COMBINED format {fmt['format_id']} ({resolution}p, {fmt['ext']}) - guaranteed audio!")
+
+                command = base_command.copy()
+                command.extend(['-f', fmt['format_id']])
+
+                try:
+                    stdout, stderr = await run_subprocess(command, timeout=120)
+
+                    if "HTTP Error 403" in stderr:
+                        logger.warning("⚠️ HTTP 403 Forbidden detected, trying next format...")
+                        continue
+
+                    video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
+                    if video_files:
+                        file_path = video_files[0]
+                        file_size = os.path.getsize(file_path)
+
+                        if file_size > TELEGRAM_SIZE_LIMIT_BYTES:
+                            logger.warning(f"⚠️ Downloaded file too large: {file_size/1024/1024:.1f}MB, removing and trying next format")
+                            os.remove(file_path)
+                            continue
+
+                        quality_log = "🔥 EXCELLENT" if resolution >= 720 else "💀 ACCEPTABLE"
+                        logger.info(f"✅ {quality_log} SUCCESS! Downloaded {resolution}p COMBINED video+audio: {file_path} ({file_size/1024/1024:.1f}MB)")
+                        return file_path
+                    else:
+                        logger.warning(f"⚠️ No video file created for combined format {fmt['format_id']}")
+
+                except Exception as e:
+                    logger.warning(f"❌ Failed combined format {fmt['format_id']} ({resolution}p): {str(e)}")
+
+    # СТРАТЕГИЯ 2: Используем умные селекторы yt-dlp для автоматического объединения
+    logger.info("🔄 YouTube Shorts: Trying smart format selectors for auto-merging...")
+    smart_selectors = [
+        # Приоритет: лучшее качество с аудио >= 720p
+        "bestvideo[height>=720]+bestaudio/best[height>=720]",
+        # Лучшее качество с аудио любого разрешения
+        "bestvideo+bestaudio/best",
+        # MP4 с аудио >= 720p
+        "bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=720]+bestaudio",
+        # MP4 с аудио любого качества
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+        # Запасные варианты
+        "best[height>=720][ext=mp4]/best[ext=mp4]",
+        "best[height>=720]/best"
     ]
-    
-    for selector in fallback_selectors:
+
+    for selector in smart_selectors:
         selector_type = "🔥 PREFERRED" if ">=720" in selector else "💀 FALLBACK"
-        logger.info(f"🎯 {selector_type} Trying fallback selector: {selector}")
-        
+        has_audio_guarantee = "+bestaudio" in selector or "bestvideo+bestaudio" in selector
+        audio_note = "🎵 GUARANTEED AUDIO" if has_audio_guarantee else "⚠️ may lack audio"
+
+        logger.info(f"🎯 {selector_type} Trying smart selector: {selector} ({audio_note})")
+
         command = base_command.copy()
         command.extend(['-f', selector])
-        
+
+        # Если селектор содержит объединение, добавляем флаг для merge
+        if '+' in selector:
+            command.extend(['--merge-output-format', 'mp4'])
+
         try:
-            stdout, stderr = await run_subprocess(command, timeout=120)
-            
+            stdout, stderr = await run_subprocess(command, timeout=180)  # Больше времени для merge
+
             video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
             if video_files:
                 file_path = video_files[0]
                 file_size = os.path.getsize(file_path)
-                
+
                 if file_size > TELEGRAM_SIZE_LIMIT_BYTES:
-                    logger.warning(f"⚠️ Fallback file too large: {file_size/1024/1024:.1f}MB")
+                    logger.warning(f"⚠️ Smart selector file too large: {file_size/1024/1024:.1f}MB")
                     os.remove(file_path)
                     continue
-                
-                logger.info(f"✅ SUCCESS with fallback selector {selector}: {file_path} ({file_size/1024/1024:.1f}MB)")
-                return file_path
-                
-        except Exception as e:
-            logger.warning(f"❌ Failed fallback selector {selector}: {str(e)}")
 
-    logger.error("❌ All YouTube Shorts download attempts failed")
+                audio_status = "🎵 WITH AUDIO" if has_audio_guarantee else "❓ audio unknown"
+                logger.info(f"✅ SUCCESS with smart selector {selector}: {file_path} ({file_size/1024/1024:.1f}MB) {audio_status}")
+                return file_path
+
+        except Exception as e:
+            logger.warning(f"❌ Failed smart selector {selector}: {str(e)}")
+
+    # СТРАТЕГИЯ 3: Последний шанс - простые селекторы
+    logger.info("🆘 YouTube Shorts: Last resort - simple selectors...")
+    simple_selectors = ["best", "worst"]
+
+    for selector in simple_selectors:
+        logger.info(f"🆘 LAST RESORT: Trying simple selector: {selector}")
+
+        command = base_command.copy()
+        command.extend(['-f', selector])
+
+        try:
+            stdout, stderr = await run_subprocess(command, timeout=120)
+
+            video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
+            if video_files:
+                file_path = video_files[0]
+                file_size = os.path.getsize(file_path)
+
+                if file_size > TELEGRAM_SIZE_LIMIT_BYTES:
+                    logger.warning(f"⚠️ Last resort file too large: {file_size/1024/1024:.1f}MB")
+                    os.remove(file_path)
+                    continue
+
+                logger.info(f"✅ LAST RESORT SUCCESS with {selector}: {file_path} ({file_size/1024/1024:.1f}MB)")
+                return file_path
+
+        except Exception as e:
+            logger.warning(f"❌ Failed last resort selector {selector}: {str(e)}")
+
+    logger.error("❌ All YouTube Shorts download strategies failed")
     return None
 
 async def get_video_metadata(video_path: str) -> tuple[int | None, int | None, int | None]:
@@ -1129,7 +1178,7 @@ def main():
 
     async def post_init(application):
         await setup_commands(application)
-    
+
     application.post_init = post_init
     application.run_polling()
 
