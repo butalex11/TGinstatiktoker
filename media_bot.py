@@ -892,6 +892,10 @@ async def downloadmp3_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
 async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    import traceback
+    import shutil
+    import os  # ✅ используем глобальный импорт, без переопределений
+
     global _current_bot_context
     _current_bot_context = context
 
@@ -919,6 +923,14 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if video_path:
+            # 🔹 Проверяем размер файла ДО отправки
+            file_size = os.path.getsize(video_path)
+            if file_size > 50 * 1024 * 1024:  # 50 MB
+                await status_msg.edit_text("⚠️ Сори, видео больше 50 МБ, а других форматов нет 😔")
+                logger.warning(f"Video too large to send: {file_size / (1024*1024):.2f} MB")
+                return  # Прерываем выполнение, не пытаемся отправить
+
+            # 🔹 Получаем метаданные и отправляем видео
             caption = f"Instagram <a href=\"{url}\">видео</a> отправил {user.mention_html()}"
             width, height, duration = await get_video_metadata(video_path)
 
@@ -933,18 +945,22 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
                     duration=duration,
                     supports_streaming=True
                 )
+
             await context.bot.delete_message(chat_id, msg_id)
             success = True
+
         else:
+            # Если видео не удалось скачать
             await status_msg.edit_text(
                 "Не удалось скачать это видео. 😔\nВозможно, пост приватный, 18+ или аккаунты заблокированы."
             )
-            # Отправляем ошибку админу только если это реальная ошибка скачивания
-            error_details = f"Instagram download failed for URL: {url}\n"
-            error_details += f"User: {user.username or user.first_name} (ID: {user.id})\n"
-            error_details += f"Chat ID: {chat_id}\n"
-            error_details += f"Message ID: {msg_id}\n"
-            error_details += "All cookie files failed to download the video."
+            error_details = (
+                f"Instagram download failed for URL: {url}\n"
+                f"User: {user.username or user.first_name} (ID: {user.id})\n"
+                f"Chat ID: {chat_id}\n"
+                f"Message ID: {msg_id}\n"
+                "All cookie files failed to download the video."
+            )
 
             await send_error_to_admin(
                 context,
@@ -952,17 +968,20 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
                 error_details,
                 "Instagram"
             )
+
     except Exception as e:
         logger.error(f"❌ Error processing Instagram: {e}", exc_info=True)
-        await status_msg.edit_text("Произошла непредвиденная ошибка.")
+        await status_msg.edit_text("Произошла непредвиденная ошибка. 😔")
 
         # Отправляем детальную ошибку админу
-        error_details = f"Instagram processing error for URL: {url}\n"
-        error_details += f"User: {user.username or user.first_name} (ID: {user.id})\n"
-        error_details += f"Chat ID: {chat_id}\n"
-        error_details += f"Message ID: {msg_id}\n\n"
-        error_details += f"Exception: {str(e)}\n\n"
-        error_details += f"Traceback:\n{traceback.format_exc()}"
+        error_details = (
+            f"Instagram processing error for URL: {url}\n"
+            f"User: {user.username or user.first_name} (ID: {user.id})\n"
+            f"Chat ID: {chat_id}\n"
+            f"Message ID: {msg_id}\n\n"
+            f"Exception: {str(e)}\n\n"
+            f"Traceback:\n{traceback.format_exc()}"
+        )
 
         await send_error_to_admin(
             context,
@@ -970,13 +989,22 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
             error_details,
             "Instagram"
         )
+
     finally:
         _current_bot_context = None
+
         if success:
-            try: await status_msg.delete()
-            except Exception: pass
-        if os.path.exists(temp_folder):
-            shutil.rmtree(temp_folder)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        # 🔹 Безопасно удаляем временную папку
+        try:
+            if os.path.exists(temp_folder):
+                shutil.rmtree(temp_folder)
+        except Exception as cleanup_error:
+            logger.warning(f"Не удалось удалить временную папку {temp_folder}: {cleanup_error}")
 
 async def process_tiktok_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     global _current_bot_context
