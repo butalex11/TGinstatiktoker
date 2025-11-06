@@ -311,7 +311,7 @@ def find_instagram_url(text: str):
     return match.group(0) if match else None
 
 def find_tiktok_url(text: str):
-    pattern = r"https?://(?:www\.|vm\.)?tiktok\.com/(@[\w\.-]+/video/\d+|[\w-]+)"
+    pattern = r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/(@[\w\.-]+/video/\d+|[\w-]+)"
     match = re.search(pattern, text)
     return match.group(0) if match else None
 
@@ -321,7 +321,7 @@ def find_youtube_shorts_url(text: str):
     return match.group(0) if match else None
 
 def resolve_tiktok_url(url: str):
-    if "vm.tiktok.com" in url:
+    if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
         try: return requests.head(url, allow_redirects=True, timeout=10).url
         except requests.RequestException: return url
     return url
