@@ -8,6 +8,7 @@ import json
 import itertools
 import traceback
 import tempfile
+import time
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -34,6 +35,15 @@ ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")
 TEMP_DOWNLOADS_DIR = "/app/bot_temp"
 COOKIES_DIR = "/app/cookies"
 TELEGRAM_SIZE_LIMIT_BYTES = 49 * 1024 * 1024 # 49 МБ для надежности
+TELEGRAM_CONNECT_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "30"))
+TELEGRAM_READ_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_READ_TIMEOUT_SECONDS", "180"))
+TELEGRAM_WRITE_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_WRITE_TIMEOUT_SECONDS", "180"))
+TELEGRAM_POOL_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_POOL_TIMEOUT_SECONDS", "30"))
+TELEGRAM_SEND_VIDEO_ATTEMPTS = int(os.getenv("TELEGRAM_SEND_VIDEO_ATTEMPTS", "4"))
+TELEGRAM_SEND_VIDEO_RETRY_DELAY_SECONDS = int(os.getenv("TELEGRAM_SEND_VIDEO_RETRY_DELAY_SECONDS", "10"))
+YTDLP_SOCKET_TIMEOUT_SECONDS = int(os.getenv("YTDLP_SOCKET_TIMEOUT_SECONDS", "60"))
+YTDLP_RETRIES = int(os.getenv("YTDLP_RETRIES", "10"))
+YTDLP_FRAGMENT_RETRIES = int(os.getenv("YTDLP_FRAGMENT_RETRIES", "10"))
 
 if not BOT_TOKEN or not GROUP_IDS_STR:
     logging.critical("ERROR: BOT_TOKEN, ALLOWED_GROUP_IDS environment variables not set!")
@@ -70,6 +80,159 @@ mp3_downloader = MP3Downloader(TEMP_DOWNLOADS_DIR, TELEGRAM_SIZE_LIMIT_BYTES)
 _current_bot_context = None
 # Глобальная переменная для хранения последнего STDERR от yt-dlp
 _last_ytdlp_stderr = ""
+_last_video_send_debug = ""
+
+def get_ytdlp_network_options() -> list[str]:
+    return [
+        '--socket-timeout', str(YTDLP_SOCKET_TIMEOUT_SECONDS),
+        '--retries', str(YTDLP_RETRIES),
+        '--fragment-retries', str(YTDLP_FRAGMENT_RETRIES),
+    ]
+
+def format_file_debug_info(file_path: str | None) -> str:
+    if not file_path:
+        return "File: not provided"
+
+    try:
+        stat = os.stat(file_path)
+        return (
+            f"File path: {file_path}\n"
+            f"File exists: yes\n"
+            f"File size bytes: {stat.st_size}\n"
+            f"File size MB: {stat.st_size / 1024 / 1024:.2f}\n"
+            f"File modified: {datetime.fromtimestamp(stat.st_mtime).strftime('%d.%m.%Y %H:%M:%S')}"
+        )
+    except FileNotFoundError:
+        return f"File path: {file_path}\nFile exists: no"
+    except Exception as e:
+        return f"File path: {file_path}\nFile info error: {type(e).__name__}: {e}"
+
+def format_video_send_debug(
+    platform: str,
+    source_url: str,
+    chat_id: int,
+    message_id: int,
+    user,
+    video_path: str,
+    width: int | None,
+    height: int | None,
+    duration: int | None,
+    attempts: list[str],
+) -> str:
+    username = getattr(user, "username", None) or getattr(user, "first_name", "unknown")
+    user_id = getattr(user, "id", "unknown")
+
+    lines = [
+        "TELEGRAM VIDEO SEND DEBUG:",
+        "-" * 50,
+        f"Platform: {platform}",
+        f"Source URL: {source_url}",
+        f"User: {username} (ID: {user_id})",
+        f"Chat ID: {chat_id}",
+        f"Message ID: {message_id}",
+        f"Video metadata: width={width}, height={height}, duration={duration}",
+        f"Configured attempts: {TELEGRAM_SEND_VIDEO_ATTEMPTS}",
+        f"Timeouts: connect={TELEGRAM_CONNECT_TIMEOUT_SECONDS}s, read={TELEGRAM_READ_TIMEOUT_SECONDS}s, write={TELEGRAM_WRITE_TIMEOUT_SECONDS}s, pool={TELEGRAM_POOL_TIMEOUT_SECONDS}s",
+        format_file_debug_info(video_path),
+        "",
+        "Attempts:",
+    ]
+    lines.extend(attempts or ["No attempts recorded"])
+    return "\n".join(lines)
+
+async def send_video_with_retries(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    video_path: str,
+    caption: str,
+    parse_mode: str,
+    width: int | None,
+    height: int | None,
+    duration: int | None,
+    supports_streaming: bool,
+    platform: str,
+    source_url: str,
+    user,
+    message_id: int,
+):
+    global _last_video_send_debug
+
+    attempts_log = []
+    last_error = None
+
+    for attempt in range(1, TELEGRAM_SEND_VIDEO_ATTEMPTS + 1):
+        started_at = time.monotonic()
+        logger.info(
+            f"Sending {platform} video to Telegram attempt {attempt}/{TELEGRAM_SEND_VIDEO_ATTEMPTS}. "
+            f"{format_file_debug_info(video_path).replace(chr(10), '; ')}"
+        )
+
+        try:
+            with open(video_path, 'rb') as vf:
+                result = await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=vf,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    width=width,
+                    height=height,
+                    duration=duration,
+                    supports_streaming=supports_streaming,
+                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
+                    write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
+                    pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+                )
+
+            elapsed = time.monotonic() - started_at
+            attempts_log.append(f"Attempt {attempt}: success in {elapsed:.1f}s")
+            _last_video_send_debug = format_video_send_debug(
+                platform, source_url, chat_id, message_id, user,
+                video_path, width, height, duration, attempts_log
+            )
+            logger.info(f"Telegram send_video succeeded on attempt {attempt} in {elapsed:.1f}s")
+            return result
+
+        except RetryAfter as e:
+            elapsed = time.monotonic() - started_at
+            last_error = e
+            retry_delay = int(e.retry_after) + 1
+            attempts_log.append(
+                f"Attempt {attempt}: RetryAfter after {elapsed:.1f}s; retry_after={e.retry_after}s"
+            )
+        except (TimedOut, NetworkError) as e:
+            elapsed = time.monotonic() - started_at
+            last_error = e
+            retry_delay = TELEGRAM_SEND_VIDEO_RETRY_DELAY_SECONDS * attempt
+            attempts_log.append(
+                f"Attempt {attempt}: {type(e).__name__} after {elapsed:.1f}s; error={e}"
+            )
+        except Exception as e:
+            elapsed = time.monotonic() - started_at
+            attempts_log.append(
+                f"Attempt {attempt}: non-retryable {type(e).__name__} after {elapsed:.1f}s; error={e}"
+            )
+            _last_video_send_debug = format_video_send_debug(
+                platform, source_url, chat_id, message_id, user,
+                video_path, width, height, duration, attempts_log
+            )
+            raise
+
+        _last_video_send_debug = format_video_send_debug(
+            platform, source_url, chat_id, message_id, user,
+            video_path, width, height, duration, attempts_log
+        )
+
+        if attempt < TELEGRAM_SEND_VIDEO_ATTEMPTS:
+            logger.warning(
+                f"Telegram send_video failed on attempt {attempt}/{TELEGRAM_SEND_VIDEO_ATTEMPTS}; "
+                f"retrying in {retry_delay}s: {type(last_error).__name__}: {last_error}"
+            )
+            await asyncio.sleep(retry_delay)
+
+    logger.error(f"Telegram send_video failed after {TELEGRAM_SEND_VIDEO_ATTEMPTS} attempts")
+    raise last_error
 
 # --- ФУНКЦИЯ ОТПРАВКИ ОШИБОК АДМИНУ ---
 async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_message: str, error_details: str, platform: str = "Unknown"):
@@ -106,6 +269,12 @@ async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_message:
                 tmp_file.write(f"{'-'*50}\n")
                 tmp_file.write(_last_ytdlp_stderr)
 
+            if _last_video_send_debug.strip():
+                tmp_file.write(f"\n\n{'='*50}\n")
+                tmp_file.write("LAST TELEGRAM VIDEO SEND DEBUG:\n")
+                tmp_file.write(f"{'-'*50}\n")
+                tmp_file.write(_last_video_send_debug)
+
             tmp_file_path = tmp_file.name
 
         # Отправляем сообщение с файлом
@@ -115,7 +284,11 @@ async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_message:
                 document=error_file,
                 caption=admin_message,
                 parse_mode="HTML",
-                filename=f"error_{platform}_{timestamp.replace(':', '-').replace(' ', '_')}.txt"
+                filename=f"error_{platform}_{timestamp.replace(':', '-').replace(' ', '_')}.txt",
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
+                write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
+                pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
             )
 
         # Удаляем временный файл
@@ -326,7 +499,7 @@ def resolve_tiktok_url(url: str):
         except requests.RequestException: return url
     return url
 
-async def run_subprocess(command: list[str], timeout: int = 180, suppress_stdout_log: bool = False) -> tuple[str, str]:
+async def run_subprocess(command: list[str], timeout: int = 300, suppress_stdout_log: bool = False) -> tuple[str, str]:
     global _last_ytdlp_stderr
 
     logger.info(f"🛠 Запуск команды: {' '.join(command)}")
@@ -370,6 +543,7 @@ async def process_instagram_with_cookie(cookie_path: str, url: str, temp_folder:
 
     check_command = [
         'yt-dlp',
+        *get_ytdlp_network_options(),
         '--dump-json',
         '--no-warnings',
         '--playlist-items', '1',
@@ -379,7 +553,7 @@ async def process_instagram_with_cookie(cookie_path: str, url: str, temp_folder:
     ]
 
     # Подавляем STDOUT логирование для команды проверки
-    stdout, stderr = await run_subprocess(check_command, timeout=30, suppress_stdout_log=True)
+    stdout, stderr = await run_subprocess(check_command, timeout=90, suppress_stdout_log=True)
 
     # Проверяем, содержит ли STDERR сообщение о том, что видео форматы не найдены
     if "No video formats found!" in stderr:
@@ -424,7 +598,8 @@ async def process_instagram_with_cookie(cookie_path: str, url: str, temp_folder:
         '-o', os.path.join(temp_folder, 'final_video.%(ext)s'),
         '--no-warnings',
         '--cookies', cookie_path,
-        '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0'
+        '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
+        *get_ytdlp_network_options()
     ]
 
     try:
@@ -432,7 +607,7 @@ async def process_instagram_with_cookie(cookie_path: str, url: str, temp_folder:
     except Exception:
         # План Б: fallback на любой best
         logger.warning("Failed to download format <= 720p, trying best available...")
-        yt_dlp_download_command[4] = "best"
+        yt_dlp_download_command[5] = "best"
         await run_subprocess(yt_dlp_download_command)
 
     video_files = glob.glob(os.path.join(temp_folder, '*.mp4'))
@@ -474,13 +649,14 @@ async def process_tiktok_with_cookie(cookie_path: str, url: str, temp_folder: st
     # Команда для получения информации с cookies
     yt_dlp_list_command = [
         'yt-dlp',
+        *get_ytdlp_network_options(),
         '--dump-json',
         '--cookies', cookie_path,
         '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
         url
     ]
 
-    stdout, stderr = await run_subprocess(yt_dlp_list_command, timeout=60, suppress_stdout_log=True)
+    stdout, stderr = await run_subprocess(yt_dlp_list_command, timeout=90, suppress_stdout_log=True)
 
     # Проверяем ошибки аутентификации
     if "This post may not be comfortable for some audiences" in stderr or "Log in for access" in stderr:
@@ -513,7 +689,8 @@ async def process_tiktok_with_cookie(cookie_path: str, url: str, temp_folder: st
         '-o', os.path.join(temp_folder, 'final_video.%(ext)s'),
         '--no-warnings',
         '--cookies', cookie_path,
-        '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+        '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+        *get_ytdlp_network_options()
     ]
 
     await run_subprocess(yt_dlp_download_command)
@@ -532,8 +709,8 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
     try:
         logger.info(f"🎬 TikTok: Trying without cookies first for URL: {url}")
 
-        yt_dlp_list_command = ['yt-dlp', '--dump-json', url]
-        stdout, stderr = await run_subprocess(yt_dlp_list_command, timeout=60, suppress_stdout_log=True)
+        yt_dlp_list_command = ['yt-dlp', *get_ytdlp_network_options(), '--dump-json', url]
+        stdout, stderr = await run_subprocess(yt_dlp_list_command, timeout=90, suppress_stdout_log=True)
 
         # Если в stderr есть сообщение об ограничении, переходим к cookies
         if "This post may not be comfortable for some audiences" in stderr or "Log in for access" in stderr:
@@ -578,7 +755,8 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
         logger.info("⬬ TikTok: Downloading selected format...")
         yt_dlp_download_command = [
             'yt-dlp', url, '-f', chosen_format_str,
-            '-o', os.path.join(temp_folder, 'final_video.%(ext)s'), '--no-warnings'
+            '-o', os.path.join(temp_folder, 'final_video.%(ext)s'), '--no-warnings',
+            *get_ytdlp_network_options()
         ]
         await run_subprocess(yt_dlp_download_command)
 
@@ -602,7 +780,7 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
 
     # Получаем информацию о доступных форматах
     info_command = [
-        'yt-dlp', '--dump-json', '--no-warnings',
+        'yt-dlp', *get_ytdlp_network_options(), '--dump-json', '--no-warnings',
         '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
         '--add-header', 'Referer: https://www.youtube.com/',
         url
@@ -612,7 +790,7 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
     for info_attempt in range(1, 4):
         try:
             logger.info(f"🔍 YouTube Shorts: Getting info attempt {info_attempt}/3")
-            stdout, stderr = await run_subprocess(info_command, timeout=60, suppress_stdout_log=True)
+            stdout, stderr = await run_subprocess(info_command, timeout=90, suppress_stdout_log=True)
 
             if not stdout.strip():
                 logger.warning(f"⚠️ Empty response on info attempt {info_attempt}")
@@ -689,6 +867,7 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
 
     base_command = [
         'yt-dlp', '--rm-cache-dir', '--force-ipv4',
+        *get_ytdlp_network_options(),
         '--add-header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
         '--add-header', 'Referer: https://www.youtube.com/',
         '--http-chunk-size', '10M',
@@ -736,7 +915,7 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
                 command.extend(['-f', fmt['format_id']])
 
                 try:
-                    stdout, stderr = await run_subprocess(command, timeout=120)
+                    stdout, stderr = await run_subprocess(command, timeout=240)
 
                     if "HTTP Error 403" in stderr:
                         logger.warning("⚠️ HTTP 403 Forbidden detected, trying next format...")
@@ -792,7 +971,7 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
             command.extend(['--merge-output-format', 'mp4'])
 
         try:
-            stdout, stderr = await run_subprocess(command, timeout=180)  # Больше времени для merge
+            stdout, stderr = await run_subprocess(command, timeout=300)  # Больше времени для merge
 
             video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
             if video_files:
@@ -822,7 +1001,7 @@ async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) 
         command.extend(['-f', selector])
 
         try:
-            stdout, stderr = await run_subprocess(command, timeout=120)
+            stdout, stderr = await run_subprocess(command, timeout=240)
 
             video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
             if video_files:
@@ -896,8 +1075,9 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
     import shutil
     import os  # ✅ используем глобальный импорт, без переопределений
 
-    global _current_bot_context
+    global _current_bot_context, _last_video_send_debug
     _current_bot_context = context
+    _last_video_send_debug = ""
 
     chat_id, msg_id, user = update.effective_chat.id, update.message.message_id, update.effective_user
 
@@ -934,17 +1114,21 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
             caption = f"Instagram <a href=\"{url}\">видео</a> отправил {user.mention_html()}"
             width, height, duration = await get_video_metadata(video_path)
 
-            with open(video_path, 'rb') as vf:
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=vf,
-                    caption=caption,
-                    parse_mode="HTML",
-                    width=width,
-                    height=height,
-                    duration=duration,
-                    supports_streaming=True
-                )
+            await send_video_with_retries(
+                context,
+                chat_id=chat_id,
+                video_path=video_path,
+                caption=caption,
+                parse_mode="HTML",
+                width=width,
+                height=height,
+                duration=duration,
+                supports_streaming=True,
+                platform="Instagram",
+                source_url=url,
+                user=user,
+                message_id=msg_id,
+            )
 
             await context.bot.delete_message(chat_id, msg_id)
             success = True
@@ -1007,8 +1191,9 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
             logger.warning(f"Не удалось удалить временную папку {temp_folder}: {cleanup_error}")
 
 async def process_tiktok_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    global _current_bot_context
+    global _current_bot_context, _last_video_send_debug
     _current_bot_context = context
+    _last_video_send_debug = ""
 
     chat_id, msg_id, user = update.effective_chat.id, update.message.message_id, update.effective_user
 
@@ -1036,17 +1221,21 @@ async def process_tiktok_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             caption = f"TikTok <a href=\"{url}\">видео</a> отправил {user.mention_html()}"
             width, height, duration = await get_video_metadata(video_path)
 
-            with open(video_path, 'rb') as vf:
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=vf,
-                    caption=caption,
-                    parse_mode="HTML",
-                    width=width,
-                    height=height,
-                    duration=duration,
-                    supports_streaming=True
-                )
+            await send_video_with_retries(
+                context,
+                chat_id=chat_id,
+                video_path=video_path,
+                caption=caption,
+                parse_mode="HTML",
+                width=width,
+                height=height,
+                duration=duration,
+                supports_streaming=True,
+                platform="TikTok",
+                source_url=resolved_url,
+                user=user,
+                message_id=msg_id,
+            )
             await context.bot.delete_message(chat_id, msg_id)
             success = True
         else:
@@ -1094,6 +1283,8 @@ async def process_tiktok_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             shutil.rmtree(temp_folder)
 
 async def process_youtube_shorts_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    global _last_video_send_debug
+    _last_video_send_debug = ""
     chat_id, msg_id, user = update.effective_chat.id, update.message.message_id, update.effective_user
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -1109,17 +1300,21 @@ async def process_youtube_shorts_link(update: Update, context: ContextTypes.DEFA
             caption = f"YouTube Shorts <a href=\"{url}\">видео</a> отправил {user.mention_html()}"
             width, height, duration = await get_video_metadata(video_path)
 
-            with open(video_path, 'rb') as vf:
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=vf,
-                    caption=caption,
-                    parse_mode="HTML",
-                    width=width,
-                    height=height,
-                    duration=duration,
-                    supports_streaming=True
-                )
+            await send_video_with_retries(
+                context,
+                chat_id=chat_id,
+                video_path=video_path,
+                caption=caption,
+                parse_mode="HTML",
+                width=width,
+                height=height,
+                duration=duration,
+                supports_streaming=True,
+                platform="YouTube Shorts",
+                source_url=url,
+                user=user,
+                message_id=msg_id,
+            )
             await context.bot.delete_message(chat_id, msg_id)
             success = True
         else:
@@ -1197,7 +1392,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.error(f"❌ Ошибка Telegram Bot API: {type(error).__name__}: {str(error)}")
 
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT_SECONDS)
+        .read_timeout(TELEGRAM_READ_TIMEOUT_SECONDS)
+        .write_timeout(TELEGRAM_WRITE_TIMEOUT_SECONDS)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
+        .build()
+    )
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("downloadmp3", downloadmp3_command))
