@@ -703,7 +703,28 @@ async def process_tiktok_with_cookie(cookie_path: str, url: str, temp_folder: st
         raise Exception("yt-dlp did not create final file")
 
 async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple[str | None, str | None]:
-    """Скачивает TikTok видео с поддержкой cookies. Возвращает (video_path, error_message)"""
+    """Скачивает TikTok видео: сначала без cookies, при любой ошибке пробует cookies."""
+
+    async def try_with_tiktok_cookies(reason: str) -> tuple[str | None, str | None]:
+        """Запускает ротацию TikTok cookies после неудачной попытки без cookies."""
+        logger.info(f"🍪 TikTok: Attempt without cookies failed ({reason}). Trying with cookies...")
+
+        if not tiktok_cookie_rotator.cookie_files:
+            logger.warning("❌ TikTok: No cookie files available for fallback")
+            return None, "Не удалось скачать TikTok без cookies, а TikTok cookies не настроены"
+
+        try:
+            video_path = await tiktok_cookie_rotator.try_with_all_cookies_async(
+                process_tiktok_with_cookie,
+                url,
+                temp_folder
+            )
+            return video_path, None
+        except Exception as cookie_error:
+            # Все cookies уже были перебраны ротатором. Возвращаем None, None,
+            # чтобы process_tiktok_link отправил полный диагностический отчет админу.
+            logger.error(f"❌ All TikTok cookies failed: {cookie_error}")
+            return None, None
 
     # Сначала пробуем без cookies
     try:
@@ -712,29 +733,31 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
         yt_dlp_list_command = ['yt-dlp', *get_ytdlp_network_options(), '--dump-json', url]
         stdout, stderr = await run_subprocess(yt_dlp_list_command, timeout=90, suppress_stdout_log=True)
 
-        # Если в stderr есть сообщение об ограничении, переходим к cookies
-        if "This post may not be comfortable for some audiences" in stderr or "Log in for access" in stderr:
-            logger.info("🍪 TikTok: Authentication required, trying with cookies...")
+        # Любая явная ошибка yt-dlp на этапе получения метаданных должна приводить
+        # к попытке с cookies, а не к json.loads() пустого stdout.
+        auth_markers = (
+            "This post may not be comfortable for some audiences",
+            "Log in for access",
+            "TikTok is requiring login for access to this content",
+        )
 
-            if not tiktok_cookie_rotator.cookie_files:
-                logger.warning("❌ TikTok: No cookie files available for restricted content")
-                return None, "Этот TikTok пост требует авторизации, но TikTok cookies не настроены"
+        if any(marker in stderr for marker in auth_markers):
+            return await try_with_tiktok_cookies("TikTok requires authentication")
 
-            # Используем механизм ротации TikTok cookies
-            try:
-                video_path = await tiktok_cookie_rotator.try_with_all_cookies_async(
-                    process_tiktok_with_cookie,
-                    url,
-                    temp_folder
-                )
-                return video_path, None
-            except Exception as cookie_error:
-                # Только здесь возвращаем None, None чтобы вызвать отправку админу
-                logger.error(f"❌ All TikTok cookies failed: {cookie_error}")
-                return None, None
+        if "ERROR:" in stderr:
+            error_line = next(
+                (line.strip() for line in stderr.splitlines() if line.strip().startswith("ERROR:")),
+                "yt-dlp returned an error"
+            )
+            return await try_with_tiktok_cookies(error_line)
 
-        # Если нет ограничений, продолжаем обычную загрузку без cookies
-        video_info = json.loads(stdout)
+        if not stdout.strip():
+            return await try_with_tiktok_cookies("yt-dlp returned empty metadata output")
+
+        try:
+            video_info = json.loads(stdout)
+        except json.JSONDecodeError as json_error:
+            return await try_with_tiktok_cookies(f"invalid JSON from yt-dlp: {json_error}")
 
         logger.info("🎬 TikTok: Selecting best format under 50 MB...")
         candidate_formats = []
@@ -745,10 +768,14 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
                     candidate_formats.append(f)
 
         if not candidate_formats:
-            # Это ошибка без попытки cookies - не отправляем админу
-            return None, "Нет подходящих форматов видео под 50 МБ"
+            # Cookies могут дать другой набор форматов, поэтому не завершаем обработку здесь.
+            return await try_with_tiktok_cookies("no suitable combined video+audio formats under 50 MB")
 
-        best_format = sorted(candidate_formats, key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)[0]
+        best_format = sorted(
+            candidate_formats,
+            key=lambda x: (x.get('height') or 0, x.get('tbr') or 0),
+            reverse=True
+        )[0]
         chosen_format_str = best_format['format_id']
         logger.info(f"✅ TikTok: Selected best format ({best_format.get('height')}p) with ID: {chosen_format_str}")
 
@@ -758,21 +785,26 @@ async def download_video_with_yt_dlp_tiktok(url: str, temp_folder: str) -> tuple
             '-o', os.path.join(temp_folder, 'final_video.%(ext)s'), '--no-warnings',
             *get_ytdlp_network_options()
         ]
-        await run_subprocess(yt_dlp_download_command)
+        _, download_stderr = await run_subprocess(yt_dlp_download_command)
 
-        video_files = glob.glob(os.path.join(temp_folder, 'final_video.*'))
+        video_files = [
+            path for path in glob.glob(os.path.join(temp_folder, 'final_video.*'))
+            if os.path.isfile(path) and not path.endswith(('.part', '.ytdl', '.temp'))
+        ]
         if video_files:
             logger.info(f"✅ TikTok video successfully downloaded: {video_files[0]}")
             return video_files[0], None
-        else:
-            # Это ошибка без попытки cookies - не отправляем админу
-            return None, "Не удалось создать видеофайл"
+
+        error_line = next(
+            (line.strip() for line in download_stderr.splitlines() if line.strip().startswith("ERROR:")),
+            "yt-dlp did not create final video file"
+        )
+        return await try_with_tiktok_cookies(error_line)
 
     except Exception as e:
-        # Это ошибка при попытке без cookies - не отправляем админу
-        error_msg = str(e)
+        # Даже непредвиденная ошибка в no-cookie ветке не должна блокировать fallback.
         logger.error(f"❌ Failed to download TikTok video without cookies: {e}")
-        return None, f"Ошибка скачивания: {error_msg}"
+        return await try_with_tiktok_cookies(str(e))
 
 async def download_video_with_yt_dlp_youtube_shorts(url: str, temp_folder: str) -> str | None:
     """Скачивает YouTube Shorts с гарантированным звуком, приоритет 720p и выше"""
